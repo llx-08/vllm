@@ -224,6 +224,55 @@ def test_preempt_defers_free_and_clears_bookkeeping():
     assert pool.get_num_free_blocks() == num_free_initially
 
 
+def test_deferred_preemption_keeps_running_requests_schedulable():
+    scheduler = create_scheduler(
+        model=MODEL,
+        async_scheduling=True,
+        num_blocks=4,
+        block_size=16,
+    )
+    scheduler.defer_block_free = True
+
+    blocked = create_requests(
+        num_requests=1,
+        num_tokens=16,
+        max_tokens=5,
+        req_ids=["blocked"],
+    )[0]
+    runnable = create_requests(
+        num_requests=1,
+        num_tokens=8,
+        max_tokens=5,
+        req_ids=["runnable"],
+    )[0]
+    victim = create_requests(
+        num_requests=1,
+        num_tokens=8,
+        max_tokens=5,
+        req_ids=["victim"],
+    )[0]
+    requests = [blocked, runnable, victim]
+    for request in requests:
+        scheduler.add_request(request)
+
+    out0 = scheduler.schedule()
+    assert set(out0.num_scheduled_tokens) == {
+        request.request_id for request in requests
+    }
+    assert scheduler.kv_cache_manager.block_pool.get_num_free_blocks() == 0
+
+    # "blocked" needs a new block at the block boundary. The FCFS victim is
+    # still in flight, so preempting it would only defer its blocks and retrying
+    # allocation would cascade through the running queue. Instead, keep all
+    # requests running and schedule the suffix that still fits existing blocks.
+    out1 = scheduler.schedule()
+    assert out1.num_scheduled_tokens == {"runnable": 1, "victim": 1}
+    assert scheduler.running == requests
+    assert len(scheduler.waiting) == 0
+    assert not scheduler.deferred_frees
+    assert all(request.num_preemptions == 0 for request in requests)
+
+
 def test_multiple_deferred_frees_drain_in_order():
     scheduler = _create_deferring_scheduler()
     pool = scheduler.kv_cache_manager.block_pool

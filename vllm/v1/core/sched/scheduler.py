@@ -626,6 +626,7 @@ class Scheduler(SchedulerInterface):
                 continue
 
             # Schedule newly needed KV blocks for the request.
+            preemption_deferred = False
             with record_function_or_nullcontext("schedule: allocate_slots"):
                 while True:
                     new_blocks = self.kv_cache_manager.allocate_slots(
@@ -645,6 +646,18 @@ class Scheduler(SchedulerInterface):
                             self.running,
                             key=lambda r: (r.priority, r.arrival_time),
                         )
+                    else:
+                        preempted_req = self.running[-1]
+
+                    # Preemption can only make allocation progress when the
+                    # victim's blocks are returned to the free pool immediately.
+                    # Keep an in-flight victim running and try later requests,
+                    # which may not need any new blocks.
+                    if self._should_defer_free(preempted_req):
+                        preemption_deferred = True
+                        break
+
+                    if self.policy == SchedulingPolicy.PRIORITY:
                         # Record the index of the preemption victim to
                         # maintain accurate loop state.
                         victim_index = self.running.index(preempted_req)
@@ -675,7 +688,7 @@ class Scheduler(SchedulerInterface):
                                 )
                                 encoder_compute_budget += num_embeds_to_restore
                     else:
-                        preempted_req = self.running.pop()
+                        self.running.pop()
 
                     self._preempt_request(
                         preempted_req,
@@ -689,6 +702,9 @@ class Scheduler(SchedulerInterface):
 
             if new_blocks is None:
                 # Cannot schedule this request.
+                if preemption_deferred:
+                    req_index += 1
+                    continue
                 break
 
             # Schedule the request.
@@ -2430,16 +2446,19 @@ class Scheduler(SchedulerInterface):
         """Free the request's KV blocks, deferring the return to the block
         pool when an in-flight GPU step may still write them.
         """
-        if not self.defer_block_free or (
-            # Last scheduled step already processed: no in-flight write remains
-            # (always the case for a normal finish), so free now.
-            request.last_sched_seq <= self.processed_step_seq
-        ):
+        if not self._should_defer_free(request):
             self.kv_cache_manager.free(request)
             return
         blocks = self.kv_cache_manager.pop_blocks_for_free(request)
         if blocks:
             self.deferred_frees.append((self.sched_step_seq, blocks))
+
+    def _should_defer_free(self, request: Request) -> bool:
+        # Last scheduled step already processed: no in-flight write remains
+        # (always the case for a normal finish), so blocks can be freed now.
+        return (
+            self.defer_block_free and request.last_sched_seq > self.processed_step_seq
+        )
 
     def _free_cow_retained_blocks(
         self, blocks: list[KVCacheBlock], fence_seq: int
